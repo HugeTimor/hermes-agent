@@ -62,6 +62,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    safe_url_for_log,
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
@@ -1955,30 +1956,67 @@ class WeixinAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] typing stop failed for %s: %s", self.name, _safe_id(chat_id), exc)
 
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> None:
+        """Send markdown-extracted images with a visible fallback on failure.
+
+        The base implementation logs per-image failures and continues.  That is
+        fine for platforms whose URL previews are reliable, but Weixin users see
+        *nothing* when a generated-image CDN download times out before native
+        upload.  Preserve native delivery as the primary path, but if it fails
+        send the original URL as text so the user always receives a recoverable
+        handle instead of a silent missing image.
+        """
+        for image_url, alt_text in images:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            result = await self.send_image(
+                chat_id=chat_id,
+                image_url=image_url,
+                caption=alt_text or None,
+                metadata=metadata,
+            )
+            if result.success:
+                continue
+            fallback = image_url if not alt_text else f"{alt_text}\n{image_url}"
+            logger.warning(
+                "[%s] native image delivery failed for %s; sending URL fallback: %s",
+                self.name,
+                safe_url_for_log(image_url),
+                result.error,
+            )
+            await self.send(chat_id=chat_id, content=fallback, metadata=metadata)
+
     async def send_image(
         self,
         chat_id: str,
         image_url: str,
-        caption: str,
+        caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        del reply_to
         if image_url.startswith(("http://", "https://")):
-            file_path = await self._download_remote_media(image_url)
-            cleanup = True
+            try:
+                file_path = await self._download_remote_media(image_url)
+            except Exception as exc:
+                logger.error(
+                    "[%s] remote image download failed for %s: %s",
+                    self.name,
+                    safe_url_for_log(image_url),
+                    exc,
+                )
+                return SendResult(success=False, error=str(exc))
         else:
             file_path = image_url.replace("file://", "")
             if not os.path.isabs(file_path):
                 file_path = os.path.abspath(file_path)
-            cleanup = False
-        try:
-            return await self.send_document(chat_id, file_path, caption=caption, metadata=metadata)
-        finally:
-            if cleanup and file_path and os.path.exists(file_path):
-                try:
-                    os.unlink(file_path)
-                except OSError:
-                    pass
+        return await self.send_document(chat_id, file_path, caption=caption, metadata=metadata)
 
     async def send_image_file(
         self,
@@ -2062,23 +2100,49 @@ class WeixinAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     async def _download_remote_media(self, url: str) -> str:
+        from gateway.platforms.base import cache_image_from_url
         from tools.url_safety import is_safe_url
 
         if not is_safe_url(url):
-            raise ValueError(f"Blocked unsafe URL (SSRF protection): {url}")
+            raise ValueError(f"Blocked unsafe URL (SSRF protection): {safe_url_for_log(url)}")
+
+        suffix = Path(url.split("?", 1)[0]).suffix or ".bin"
+        if suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+            # Use the shared image cache downloader for generated-image URLs:
+            # it follows redirects, sends browser-ish Accept headers, validates
+            # magic bytes, and retries transient CDN timeouts.  Keeping the file
+            # in Hermes' cache also avoids deleting it before async platform
+            # upload/inspection has fully settled.
+            return await cache_image_from_url(url, ext=suffix, retries=4)
 
         assert self._send_session is not None
+        session = self._send_session
         # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
         # "Timeout context manager should be used inside a task" errors.
-        async def _do_fetch():
-            async with self._send_session.get(url) as response:
-                response.raise_for_status()
-                return await response.read()
-        data = await asyncio.wait_for(_do_fetch(), timeout=30)
-        suffix = Path(url.split("?", 1)[0]).suffix or ".bin"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
-            handle.write(data)
-            return handle.name
+        last_error: Optional[BaseException] = None
+        for attempt in range(5):
+            try:
+                async def _do_fetch():
+                    async with session.get(
+                        url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                            "Accept": "*/*",
+                        },
+                    ) as response:
+                        response.raise_for_status()
+                        return await response.read()
+                data = await asyncio.wait_for(_do_fetch(), timeout=45)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+                    handle.write(data)
+                    return handle.name
+            except Exception as exc:  # noqa: BLE001 - retry transient network errors
+                last_error = exc
+                if attempt >= 4:
+                    break
+                await asyncio.sleep(1.5 * (attempt + 1))
+        assert last_error is not None
+        raise last_error
 
     async def _send_file(
         self,

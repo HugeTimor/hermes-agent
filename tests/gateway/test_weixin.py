@@ -614,6 +614,63 @@ class TestWeixinOutboundMedia:
         assert media["encrypt_query_param"] == "enc-param"
         assert media["aes_key"] == expected_aes_key
 
+    def test_send_image_returns_failure_when_remote_download_fails(self):
+        adapter = _make_adapter()
+        adapter._download_remote_media = AsyncMock(side_effect=TimeoutError("cdn stalled"))
+        adapter.send_document = AsyncMock()
+
+        result = asyncio.run(
+            adapter.send_image(
+                chat_id="wxid_test123",
+                image_url="https://v3b.fal.media/files/example.png",
+                caption="生成图",
+            )
+        )
+
+        assert result.success is False
+        assert result.error is not None
+        assert "cdn stalled" in result.error
+        adapter.send_document.assert_not_awaited()
+
+    def test_send_multiple_images_sends_url_fallback_after_native_failure(self):
+        adapter = _make_adapter()
+        adapter.send_image = AsyncMock(return_value=SendResult(success=False, error="download timeout"))
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback"))
+
+        asyncio.run(
+            adapter.send_multiple_images(
+                chat_id="wxid_test123",
+                images=[("https://v3b.fal.media/files/example.png", "巨型宝可梦合照")],
+                metadata={"notify": True},
+            )
+        )
+
+        adapter.send_image.assert_awaited_once_with(
+            chat_id="wxid_test123",
+            image_url="https://v3b.fal.media/files/example.png",
+            caption="巨型宝可梦合照",
+            metadata={"notify": True},
+        )
+        adapter.send.assert_awaited_once_with(
+            chat_id="wxid_test123",
+            content="巨型宝可梦合照\nhttps://v3b.fal.media/files/example.png",
+            metadata={"notify": True},
+        )
+
+    def test_download_remote_media_uses_shared_image_cache_downloader(self):
+        adapter = _make_adapter()
+
+        with patch("tools.url_safety.is_safe_url", return_value=True), \
+             patch("gateway.platforms.base.cache_image_from_url", new=AsyncMock(return_value="/tmp/cached.png")) as cache_mock:
+            path = asyncio.run(adapter._download_remote_media("https://v3b.fal.media/files/example.png?token=1"))
+
+        assert path == "/tmp/cached.png"
+        cache_mock.assert_awaited_once_with(
+            "https://v3b.fal.media/files/example.png?token=1",
+            ext=".png",
+            retries=4,
+        )
+
 
 class TestWeixinRemoteMediaSafety:
     def test_download_remote_media_blocks_unsafe_urls(self):
